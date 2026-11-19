@@ -1,0 +1,6 @@
+# Bundle patch for dsh-agy-native: registers the Antigravity ACP provider route
+# in any profile where this plugin bundle is installed.
+- insert:
+    - id: agy-acp
+      name: dsh-agy-native
+      config: {}

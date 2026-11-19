@@ -1,0 +1,228 @@
+#!/usr/bin/env node
+import { createInterface } from 'node:readline';
+
+const rl = createInterface({ input: process.stdin });
+const sessions = new Map();
+let sessionCounter = 0;
+
+function send(obj) {
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...obj }) + '\n');
+}
+
+async function callMcp(mcpServer, method, params) {
+  const headers = { 'content-type': 'application/json' };
+  for (const h of mcpServer.headers ?? []) {
+    headers[h.name] = h.value;
+  }
+  const resp = await fetch(mcpServer.url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ jsonrpc: '2.0', id: Math.floor(Math.random() * 1e6), method, params }),
+  });
+  return resp.json();
+}
+
+rl.on('line', async (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+
+  if (msg.method === 'initialize') {
+    send({
+      id: msg.id,
+      result: {
+        protocolVersion: 1,
+        agentCapabilities: {
+          loadSession: true,
+          promptCapabilities: { image: true },
+          sessionCapabilities: { load: {}, close: {} },
+          _meta: { antigravity: { tier: true, systemPrompt: { append: true } } },
+        },
+      },
+    });
+    return;
+  }
+
+  if (msg.method === 'session/new') {
+    const meta = msg.params?._meta?.antigravity ?? {};
+    if (meta.excludeDefaultComponents === true) {
+      send({
+        id: msg.id,
+        error: { code: -32001, message: 'TOS violation hazard: excludeDefaultComponents must not be true' },
+      });
+      return;
+    }
+    if (meta.systemPrompt !== undefined) {
+      send({
+        id: msg.id,
+        error: { code: -32002, message: 'WAF 429 hazard: systemPrompt must never mutate official systemInstruction' },
+      });
+      return;
+    }
+    const sessionId = `fake-sess-${++sessionCounter}`;
+    sessions.set(sessionId, {
+      mcpServer: msg.params?.mcpServers?.[0],
+      modelId: 'gemini-4-carbon-medium',
+      prompts: 0,
+    });
+    send({
+      id: msg.id,
+      result: {
+        sessionId,
+        models: {
+          currentModelId: 'gemini-4-carbon-medium',
+          availableModels: [
+            { modelId: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+            { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' },
+            { modelId: 'gemini-4-hydrogen-xhigh', name: 'Gemini 4 Hydrogen (XHigh)' },
+            { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
+          ],
+        },
+        _meta: {
+          antigravity: {
+            tier: { name: 'Google AI Ultra', id: 'ultra-tier' },
+          },
+        },
+      },
+    });
+    return;
+  }
+
+  if (msg.method === 'session/set_model') {
+    const sess = sessions.get(msg.params.sessionId);
+    if (sess) sess.modelId = msg.params.modelId;
+    send({ id: msg.id, result: {} });
+    return;
+  }
+
+  if (msg.method === 'session/cancel') {
+    const sess = sessions.get(msg.params.sessionId);
+    if (sess) sess.cancelled = true;
+    return;
+  }
+
+  if (msg.method === 'session/close') {
+    sessions.delete(msg.params.sessionId);
+    send({ id: msg.id, result: {} });
+    return;
+  }
+
+  if (msg.method === 'session/prompt') {
+    const { sessionId, prompt } = msg.params;
+    const sess = sessions.get(sessionId);
+    sess.prompts += 1;
+
+    const textJoined = prompt
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('\n');
+    const imagePart = prompt.find((p) => p.type === 'image');
+
+    send({
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'usage_update', used: 512, size: 1048576 },
+      },
+    });
+
+    send({
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_thought_chunk',
+          content: { type: 'text', text: 'Thinking step...' },
+        },
+      },
+    });
+
+    if (textJoined.includes('SIMULATE_UPSTREAM_429')) {
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: '\n⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n',
+            },
+          },
+        },
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      if (!sess.cancelled) {
+        send({
+          method: 'session/update',
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: {
+                type: 'text',
+                text: '\n⚠ API error (attempt 2): SHOULD_NEVER_REACH_ATTEMPT_2\n',
+              },
+            },
+          },
+        });
+      }
+      send({ id: msg.id, result: { stopReason: sess.cancelled ? 'cancelled' : 'end_turn' } });
+      return;
+    }
+
+    if (textJoined.includes('CALL_PARALLEL_TOOLS') && sess.mcpServer) {
+      // Fire 2 concurrent MCP tools/call requests within 5ms!
+      const [r1, r2] = await Promise.all([
+        callMcp(sess.mcpServer, 'tools/call', {
+          name: 'get_left',
+          arguments: { q: 'L', toolSummary: 'left' },
+        }),
+        callMcp(sess.mcpServer, 'tools/call', {
+          name: 'get_right',
+          arguments: { q: 'R', toolSummary: 'right' },
+        }),
+      ]);
+      const combined = `${r1.result.content[0].text}+${r2.result.content[0].text}`;
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `Combined=${combined}` },
+          },
+        },
+      });
+    } else {
+      const imgTag = imagePart ? ` [img:${imagePart.mimeType}:${imagePart.data.length}]` : '';
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `Session=${sessionId} Turn=${sess.prompts} Model=${sess.modelId}${imgTag}`,
+            },
+          },
+        },
+      });
+    }
+
+    send({
+      id: msg.id,
+      result: {
+        stopReason: 'end_turn',
+        usage: {
+          inputTokens: 1000,
+          outputTokens: 50,
+          cachedReadTokens: 400,
+          cachedWriteTokens: 0,
+          thoughtTokens: 15,
+          totalTokens: 1450,
+        },
+      },
+    });
+  }
+});
