@@ -74,7 +74,7 @@ export function formatHarnessGuidelines(
   const sections: string[] = [];
   if (hasTools) {
     sections.push(
-      'Active workspace tools are mounted as eager MCP tools named `mcp_dsh_<tool_name>` (e.g. `mcp_dsh_read`, `mcp_dsh_bash`, `mcp_dsh_edit`, `mcp_dsh_glob`, `mcp_dsh_grep`). Invoke them directly when tool execution is needed.',
+      'Active workspace tools are mounted as eager MCP tools named `mcp_dsh_<tool_name>` (e.g. `mcp_dsh_read`, `mcp_dsh_bash`, `mcp_dsh_edit`, `mcp_dsh_glob`, `mcp_dsh_grep`). Invoke them directly when tool execution is needed. Do not generate Antigravity Artifacts under `brain/`; respond directly or use the `mcp_dsh_*` tools.',
     );
   }
   if (cleaned) {
