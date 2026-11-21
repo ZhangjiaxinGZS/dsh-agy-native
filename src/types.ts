@@ -97,6 +97,7 @@ export interface AgyReplayMetadata {
   lastAnchorId?: string;
   toolsFingerprint: string;
   contextDigests?: Record<string, string>;
+  historyPrefixDigest?: string;
 }
 
 /** Resolved runtime configuration for `AgyAcpAdapter`. */

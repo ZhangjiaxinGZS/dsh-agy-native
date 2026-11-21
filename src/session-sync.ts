@@ -146,6 +146,82 @@ export function computeContextDigests(messages: readonly RequestMessage[]): Reco
   return digests;
 }
 
+/**
+ * Compute a deterministic digest over conversational history messages (`user`, `assistant`, `tool`)
+ * in `[0, endExclusive)` to detect history compaction or in-place mutations (e.g. billion-context,
+ * DSH compaction, tool-result pruning, image offloading).
+ *
+ * Excludes `system`, `developer`, and attachment-free ephemeral runtime notices so that
+ * `dsh-context-os` `developer` surface updates continue using incremental sync without cold replays.
+ */
+export function computeHistoryPrefixDigest(
+  messages: readonly RequestMessage[],
+  endExclusive = messages.length,
+): string {
+  const limit = Math.max(0, Math.min(endExclusive, messages.length));
+  const hash = crypto.createHash('sha256');
+
+  for (let i = 0; i < limit; i++) {
+    const msg = messages[i]!;
+    if (msg.role === 'system' || msg.role === 'developer') continue;
+
+    if (msg.role === 'user') {
+      const plain = blocksToPlainText(msg.content).trim();
+      const hasAttachment = msg.content.some((b) => b.type === 'image' || b.type === 'file');
+      if (!hasAttachment && (!plain || isEphemeralRuntimeNotice(plain))) continue;
+      hash.update('user\0');
+      hash.update(String(Buffer.byteLength(plain, 'utf8')));
+      hash.update('\0');
+      hash.update(plain);
+      hash.update('\0');
+      continue;
+    }
+
+    if (msg.role === 'assistant') {
+      const plain = blocksToPlainText(msg.content);
+      hash.update('assistant\0');
+      hash.update(String(Buffer.byteLength(plain, 'utf8')));
+      hash.update('\0');
+      hash.update(plain);
+      hash.update('\0');
+      continue;
+    }
+
+    if (msg.role === 'tool') {
+      const toolMsg = msg as ToolResultMessage;
+      const plain = blocksToPlainText(toolMsg.content);
+      const id = String(toolMsg.toolCallId ?? '');
+      const status = toolMsg.isError ? '1' : '0';
+      hash.update('tool\0');
+      hash.update(String(Buffer.byteLength(id, 'utf8')));
+      hash.update('\0');
+      hash.update(id);
+      hash.update('\0');
+      hash.update(status);
+      hash.update('\0');
+      hash.update(String(Buffer.byteLength(plain, 'utf8')));
+      hash.update('\0');
+      hash.update(plain);
+      hash.update('\0');
+    }
+  }
+
+  return hash.digest('hex').slice(0, 24);
+}
+
+function hasMutatedHistoryPrefix(
+  messages: readonly RequestMessage[],
+  endExclusive: number,
+  expectedPrefixDigest?: string,
+  anchorPrefixDigest?: string,
+): boolean {
+  if (!expectedPrefixDigest && !anchorPrefixDigest) return false;
+  const currentPrefixDigest = computeHistoryPrefixDigest(messages, endExclusive);
+  if (expectedPrefixDigest && currentPrefixDigest !== expectedPrefixDigest) return true;
+  if (anchorPrefixDigest && currentPrefixDigest !== anchorPrefixDigest) return true;
+  return false;
+}
+
 function appendTextPart(parts: AcpPromptPart[], text: string): void {
   if (!text) return;
   const last = parts[parts.length - 1];
@@ -431,6 +507,7 @@ export function planSessionSync(opts: {
   lastToolsFingerprint?: string;
   currentToolsFingerprint: string;
   lastContextDigests?: Record<string, string>;
+  lastHistoryPrefixDigest?: string;
   pendingToolCallIds: ReadonlySet<string>;
   allowResumeFromReplay: boolean;
   forwardContextUpdates: boolean;
@@ -472,6 +549,18 @@ export function planSessionSync(opts: {
       }
 
       if (resultByCallId.size === pendingToolCallIds.size) {
+        const toolTurnReplay = extractReplayMetadata(messages[toolTurnStartIdx]!);
+        if (
+          hasMutatedHistoryPrefix(
+            messages,
+            toolTurnStartIdx,
+            opts.lastHistoryPrefixDigest ?? toolTurnReplay?.historyPrefixDigest,
+            toolTurnReplay?.historyPrefixDigest,
+          )
+        ) {
+          return { kind: 'cold-full-replay', reason: 'history-prefix-mutated-or-compacted' };
+        }
+
         const orderedIds = [...pendingToolCallIds];
         const resolutions = orderedIds.map((id, idx) => {
           const toolMsg = resultByCallId.get(id)!;
@@ -524,7 +613,14 @@ export function planSessionSync(opts: {
     return { kind: 'cold-full-replay', reason: 'no-prior-synced-anchor' };
   }
 
-  const effectiveToolsFp = opts.lastToolsFingerprint ?? anchorReplay?.toolsFingerprint;
+  const isWarmSession = Boolean(
+    opts.activeAcpSessionId &&
+      (!anchorReplay || anchorReplay.acpSessionId === opts.activeAcpSessionId),
+  );
+
+  const effectiveToolsFp = isWarmSession
+    ? (opts.lastToolsFingerprint ?? anchorReplay?.toolsFingerprint)
+    : anchorReplay?.toolsFingerprint;
   if (effectiveToolsFp && effectiveToolsFp !== opts.currentToolsFingerprint) {
     return { kind: 'cold-full-replay', reason: 'tool-declarations-changed' };
   }
@@ -534,9 +630,27 @@ export function planSessionSync(opts: {
     return { kind: 'cold-full-replay', reason: 'empty-incremental-tail' };
   }
 
+  // Detect history compaction or mutation (e.g. billion-context, DSH compaction, manual edits)
+  // before anchorIdx without treating developer/system Context OS updates as history mutations.
+  const expectedPrefixDigest = isWarmSession
+    ? (opts.lastHistoryPrefixDigest ?? anchorReplay?.historyPrefixDigest)
+    : anchorReplay?.historyPrefixDigest;
+  if (
+    hasMutatedHistoryPrefix(
+      messages,
+      anchorIdx,
+      expectedPrefixDigest,
+      anchorReplay?.historyPrefixDigest,
+    )
+  ) {
+    return { kind: 'cold-full-replay', reason: 'history-prefix-mutated-or-compacted' };
+  }
+
   // Detect any Context OS `surfaceOp: 'replace'` edits prior to anchorIdx without killing the session
   const updatedContextBlocks: string[] = [];
-  const baselineDigests = opts.lastContextDigests ?? anchorReplay?.contextDigests;
+  const baselineDigests = isWarmSession
+    ? (opts.lastContextDigests ?? anchorReplay?.contextDigests)
+    : anchorReplay?.contextDigests;
   if (opts.forwardContextUpdates && baselineDigests) {
     let ordinal = 0;
     for (let i = 0; i <= anchorIdx; i++) {
@@ -553,7 +667,7 @@ export function planSessionSync(opts: {
     }
   }
 
-  if (opts.activeAcpSessionId && (!anchorReplay || anchorReplay.acpSessionId === opts.activeAcpSessionId)) {
+  if (isWarmSession) {
     return {
       kind: 'warm-incremental',
       tailMessages,
