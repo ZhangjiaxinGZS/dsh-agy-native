@@ -77,10 +77,9 @@ export function formatHarnessGuidelines(
     const routing = ['Use only tools mounted by the DSH MCP server for this request. Do not call tools on ambient MCP servers, even when their names match.'];
     if (names?.length === 0) {
       routing.push('No DSH tools are available for this request.');
-    } else if (names?.length === 1 && names[0] === 'run_code') {
-      routing.push('In programmatic tool calling mode, invoke mcp_dsh_run_code. Inside the program, use the exact DSH tool names in the supplied SDK without the outer mcp_dsh_ prefix.');
     } else if (names) {
-      routing.push(`Available calls: ${names.map(name => `mcp_dsh_${name}`).join(', ')}.`);
+      routing.push(`Direct calls available in this request: ${names.map(name => `mcp_dsh_${name}`).join(', ')}.`);
+      routing.push('If a listed tool runs a program with a DSH SDK, invoke that entry point directly. Inside the program, use the exact DSH tool names in the supplied SDK without the outer mcp_dsh_ prefix.');
     } else {
       routing.push('Invoke the advertised mcp_dsh_<tool_name> directly.');
     }

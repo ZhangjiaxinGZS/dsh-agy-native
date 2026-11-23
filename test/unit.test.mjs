@@ -14,6 +14,7 @@ import {
   computeContextDigests,
   computeToolsFingerprint,
   createSanitizedAgyEnv,
+  encodeMcpToolName,
   formatHarnessGuidelines,
   planSessionSync,
   resolveAgyBinary,
@@ -415,6 +416,46 @@ test('workspace guidelines match the registered bridge names, including PTC-only
   setTools([]);
   assert.match(await prompt(), /No DSH tools/);
 });
+
+test('an existing literal MCP name is preserved when an encoded collision needs the same suffix', () => {
+  const original = 'issue.search';
+  const base = 'issue_search';
+  const literal = encodeMcpToolName(original, new Set([base]));
+  const used = new Set([base, literal]);
+  const encoded = encodeMcpToolName(original, used);
+  assert.equal(used.size, 3);
+  assert.ok(used.has(encoded));
+  assert.notEqual(encoded, literal);
+});
+
+for (const [preset, toolNames] of Object.entries({
+  standard: ['read', 'mcp__sample-server__list_items'],
+  ptc: ['run_code'],
+  minimal: ['read', 'bash'],
+  cordis: ['cordis', 'read', 'plugin_manager'],
+  empty: [],
+  custom: ['evaluate.workflow', 'evaluate_workflow', 'mcp__x-y__fetch', 'a'.repeat(70) + 'x', 'a'.repeat(70) + 'y'],
+})) {
+  test(`${preset} routes exactly the tools projected by the request`, () => {
+    const endpoint = new McpSessionEndpoint({
+      token: 'fixture', url: 'http://localhost', maxToolOutputBytes: 1024, batchWindowMs: 0, onDispose() {},
+    });
+    endpoint.setTools(toolNames.map(name => ({ name, description: name, parameters: { type: 'object' } })));
+    const names = endpoint.bridgeToolNames;
+    assert.equal(new Set(names).size, toolNames.length);
+    const guidelines = formatHarnessGuidelines(undefined, names);
+    const advertised = guidelines.match(/Direct calls available in this request: (.*?)\./);
+    assert.deepEqual(advertised ? advertised[1].split(', ') : [], names.map(name => `mcp_dsh_${name}`));
+    for (const name of names) {
+      assert.match(name, /^[a-zA-Z0-9_-]{1,64}$/);
+      assert.equal(endpoint.isAllowedPermissionRequest(`mcp_dsh_${name}`), true);
+      assert.equal(endpoint.isAllowedPermissionRequest('call_mcp_tool', { ServerName: 'dsh', ToolName: name }), true);
+      assert.equal(endpoint.isAllowedPermissionRequest('call_mcp_tool', { ServerName: 'external', ToolName: name }), false);
+    }
+    endpoint.setTools([]);
+    for (const name of names) assert.equal(endpoint.isAllowedPermissionRequest(`mcp_dsh_${name}`), false);
+  });
+}
 
 test('ACP allows active eager and dsh dispatcher calls and rejects other requests', () => {
   const endpoint = new McpSessionEndpoint({

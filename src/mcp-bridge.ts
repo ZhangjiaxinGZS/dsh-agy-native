@@ -34,7 +34,12 @@ export function encodeMcpToolName(name: string, usedNames: Set<string>): string 
     return base;
   }
   const suffix = crypto.createHash('sha1').update(name).digest('hex').slice(0, 6);
-  const candidate = `${base.slice(0, 56)}_${suffix}`;
+  const stem = `${base.slice(0, 56)}_${suffix}`;
+  let candidate = stem;
+  for (let n = 2; usedNames.has(candidate); n++) {
+    const tail = `_${n}`;
+    candidate = stem.slice(0, 64 - tail.length) + tail;
+  }
   usedNames.add(candidate);
   return candidate;
 }
@@ -94,7 +99,6 @@ export class McpSessionEndpoint {
 
   #tools: readonly ToolSchema[] = [];
   #mcpToDsh = new Map<string, ToolSchema>();
-  #dshToMcp = new Map<string, string>();
   #callSeq = 0;
 
   readonly #pendingById = new Map<string, PendingMcpToolCall>();
@@ -134,13 +138,11 @@ export class McpSessionEndpoint {
   setTools(tools: readonly ToolSchema[] | undefined): void {
     this.#tools = tools ?? [];
     this.#mcpToDsh.clear();
-    this.#dshToMcp.clear();
 
     const used = new Set<string>();
     for (const tool of this.#tools) {
       const mcpName = encodeMcpToolName(tool.name, used);
       this.#mcpToDsh.set(mcpName, tool);
-      this.#dshToMcp.set(tool.name, mcpName);
     }
   }
 
