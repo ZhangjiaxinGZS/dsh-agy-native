@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
   AgyModelCatalog,
   LoopbackMcpBridge,
+  McpSessionEndpoint,
   buildCatalogEntries,
   buildFullReplayPromptParts,
   classifyInBandAgyApiError,
@@ -387,6 +388,46 @@ test('formatHarnessGuidelines & buildFullReplayPromptParts strip third-party per
   const humanPos = fullText.indexOf('Reply with PONG_OK only.');
   assert.ok(reminderPos > 0);
   assert.ok(humanPos > reminderPos, 'Human request must appear after trailing runtime reminders');
+});
+
+test('workspace guidelines match the registered bridge names, including PTC-only and empty catalogs', async () => {
+  const endpoint = new McpSessionEndpoint({
+    token: 'fixture', url: 'http://localhost', maxToolOutputBytes: 1024, batchWindowMs: 0, onDispose() {},
+  });
+  const setTools = names => endpoint.setTools(names.map(name => ({
+    name, description: name, parameters: { type: 'object' },
+  })));
+  const prompt = async () => (await buildFullReplayPromptParts({
+    messages: [], bridgeToolNames: endpoint.bridgeToolNames,
+  }))[0].text;
+
+  setTools(['issue/search', 'issue_search']);
+  const standard = await prompt();
+  assert.equal(new Set(endpoint.bridgeToolNames).size, 2);
+  for (const name of endpoint.bridgeToolNames) assert.ok(standard.includes(`mcp_dsh_${name}`));
+  assert.doesNotMatch(standard, /mcp_dsh_read|mcp_dsh_run_code/);
+  setTools(['run_code']);
+  const ptc = await prompt();
+  assert.match(ptc, /mcp_dsh_run_code/);
+  assert.match(ptc, /exact DSH tool names in the supplied SDK/);
+  assert.match(ptc, /ambient MCP servers/);
+  assert.doesNotMatch(ptc, /issue_search/);
+  setTools([]);
+  assert.match(await prompt(), /No DSH tools/);
+});
+
+test('ACP allows active eager and dsh dispatcher calls and rejects other requests', () => {
+  const endpoint = new McpSessionEndpoint({
+    token: 'fixture', url: 'http://localhost', maxToolOutputBytes: 1024, batchWindowMs: 0, onDispose() {},
+  });
+  endpoint.setTools([{ name: 'run_code', parameters: { type: 'object' }, description: 'PTC' }]);
+  assert.equal(endpoint.isAllowedPermissionRequest('mcp_dsh_run_code', { toolSummary: 'Run program' }), true);
+  assert.equal(endpoint.isAllowedPermissionRequest('call_mcp_tool', { ServerName: 'dsh', ToolName: 'run_code' }), true);
+  assert.equal(endpoint.isAllowedPermissionRequest('call_mcp_tool', { ServerName: 'external', ToolName: 'run_code' }), false);
+  assert.equal(endpoint.isAllowedPermissionRequest('run_code'), false);
+  assert.equal(endpoint.isAllowedPermissionRequest('mcp_dsh_unknown'), false);
+  endpoint.setTools([]);
+  assert.equal(endpoint.isAllowedPermissionRequest('mcp_dsh_run_code'), false);
 });
 
 test('classifyInBandAgyApiError detects standalone agy 429/403 retry banners without false positives in prose', () => {

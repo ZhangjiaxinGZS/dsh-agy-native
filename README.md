@@ -106,6 +106,12 @@ AgyWorkerPool (Sticky conversation slots + isolated #auxSlot for title/summary)
 
 ---
 
+### Tool routing
+
+The adapter uses ACP's `--process-per-session` flag when the installed CLI supports it. This lets each new ACP session discover its own HTTP MCP catalog while conversation turns can still reuse a warm session. Older binaries retain their existing launch arguments. [Official ACP flag reference](https://antigravity.google/docs/ide/extensions/acp/#flags)
+
+In standard DSH sessions the model receives the exact eager names exposed by the session's `dsh` bridge. In PTC sessions the outer call is `mcp_dsh_run_code`, and the program uses the names in the DSH SDK. Ambient MCP servers can have similar names. Permission to enter the bridge applies only to a registered tool on that bridge. DSH handles execution and its own approvals.
+
 ## CLI Diagnostics & Testing
 
 ```bash

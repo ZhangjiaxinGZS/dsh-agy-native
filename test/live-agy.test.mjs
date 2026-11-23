@@ -168,6 +168,26 @@ test(
         .map((c) => c.block.text)
         .join('');
       assert.match(turn2Text, /9482/);
+
+      // A new role on this same pool slot switches from direct tools to PTC.
+      const ptc = await collectChunks(adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-3.8-flash',
+        sessionId: 'live-dsh-session-2',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'Look up the verification code for jade using the available tool.' }] }],
+        tools: [{
+          name: 'run_code',
+          description: 'Run a JavaScript program. The available SDK method is tools.lookup_magic_code({key: string}).',
+          parameters: {
+            type: 'object',
+            properties: { code: { type: 'string' } },
+            required: ['code'],
+          },
+        }],
+      }));
+      const call = ptc.find(c => c.type === 'block-end' && c.block.type === 'tool-call')?.block;
+      assert.equal(call?.name, 'run_code');
+      assert.match(JSON.parse(call.arguments).code, /lookup_magic_code/);
     } finally {
       await adapter.dispose();
       fs.rmSync(tmpCache, { recursive: true, force: true });
