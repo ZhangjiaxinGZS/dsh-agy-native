@@ -87,6 +87,18 @@ rl.on('line', async (line) => {
     return;
   }
 
+  if (msg.method === 'session/load') {
+    const sessionId = msg.params.sessionId;
+    const existing = sessions.get(sessionId);
+    sessions.set(sessionId, {
+      mcpServer: msg.params?.mcpServers?.[0] ?? existing?.mcpServer,
+      modelId: existing?.modelId ?? 'gemini-4-carbon-medium',
+      prompts: existing?.prompts ?? 1,
+    });
+    send({ id: msg.id, result: {} });
+    return;
+  }
+
   if (msg.method === 'session/set_model') {
     const sess = sessions.get(msg.params.sessionId);
     if (sess) sess.modelId = msg.params.modelId;
@@ -170,7 +182,11 @@ rl.on('line', async (line) => {
       return;
     }
 
-    if (textJoined.includes('CALL_PARALLEL_TOOLS') && sess.mcpServer) {
+    if (
+      textJoined.includes('CALL_PARALLEL_TOOLS') &&
+      !textJoined.includes('<conversation_history>') &&
+      sess.mcpServer
+    ) {
       // Fire 2 concurrent MCP tools/call requests within 5ms!
       const [r1, r2] = await Promise.all([
         callMcp(sess.mcpServer, 'tools/call', {
@@ -182,6 +198,10 @@ rl.on('line', async (line) => {
           arguments: { q: 'R', toolSummary: 'right' },
         }),
       ]);
+      if (sess.cancelled || r1?.error || r2?.error || !r1?.result || !r2?.result) {
+        send({ id: msg.id, result: { stopReason: 'cancelled' } });
+        return;
+      }
       const combined = `${r1.result.content[0].text}+${r2.result.content[0].text}`;
       send({
         method: 'session/update',
@@ -195,6 +215,9 @@ rl.on('line', async (line) => {
       });
     } else {
       const imgTag = imagePart ? ` [img:${imagePart.mimeType}:${imagePart.data.length}]` : '';
+      const echoTag = textJoined.includes('ECHO_PROMPT')
+        ? ` Prompt=${JSON.stringify(textJoined)}`
+        : '';
       send({
         method: 'session/update',
         params: {
@@ -203,7 +226,7 @@ rl.on('line', async (line) => {
             sessionUpdate: 'agent_message_chunk',
             content: {
               type: 'text',
-              text: `Session=${sessionId} Turn=${sess.prompts} Model=${sess.modelId}${imgTag}`,
+              text: `Session=${sessionId} Turn=${sess.prompts} Model=${sess.modelId}${imgTag}${echoTag}`,
             },
           },
         },

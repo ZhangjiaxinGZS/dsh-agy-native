@@ -51,6 +51,7 @@ export {
   buildFullReplayPromptParts,
   buildIncrementalPromptParts,
   computeContextDigests,
+  computeHistoryPrefixDigest,
   extractReplayMetadata,
   extractSystemPrompt,
   formatHarnessGuidelines,

@@ -16,6 +16,7 @@ import {
   buildFullReplayPromptParts,
   buildIncrementalPromptParts,
   computeContextDigests,
+  computeHistoryPrefixDigest,
   extractReplayMetadata,
   extractSystemPrompt,
   planSessionSync,
@@ -112,6 +113,7 @@ export class AgyWorkerSlot {
   #activeRawModelId?: string;
   #lastToolsFingerprint?: string;
   #lastContextDigests?: Record<string, string>;
+  #lastHistoryPrefixDigest?: string;
   #inFlightPrompt?: Promise<AcpPromptResponse>;
   #inFlightError?: Error;
 
@@ -204,6 +206,7 @@ export class AgyWorkerSlot {
         lastToolsFingerprint: this.#lastToolsFingerprint,
         currentToolsFingerprint: toolsFp,
         lastContextDigests: this.#lastContextDigests,
+        lastHistoryPrefixDigest: this.#lastHistoryPrefixDigest,
         pendingToolCallIds: pendingIds,
         allowResumeFromReplay: cfg.resumeSessions,
         forwardContextUpdates: cfg.forwardContextUpdates,
@@ -346,6 +349,10 @@ export class AgyWorkerSlot {
         };
 
         const buildReplayEnvelope = () => {
+          const historyPrefixDigest = computeHistoryPrefixDigest(
+            options.messages,
+            options.messages.length,
+          );
           const meta: AgyReplayMetadata = {
             version: 1,
             acpSessionId: this.#activeAcpSessionId ?? '',
@@ -353,9 +360,11 @@ export class AgyWorkerSlot {
             syncedMessageCount: options.messages.length + 1,
             toolsFingerprint: toolsFp,
             contextDigests: computeContextDigests(options.messages),
+            historyPrefixDigest,
           };
           this.#lastToolsFingerprint = toolsFp;
           this.#lastContextDigests = meta.contextDigests;
+          this.#lastHistoryPrefixDigest = historyPrefixDigest;
           return { response: meta };
         };
 
@@ -482,7 +491,8 @@ export class AgyWorkerSlot {
     this.#endpoint?.dispose();
     this.#endpoint = undefined;
     this.#inFlightPrompt = undefined;
-    this.#activeAcpSessionId = undefined;
+    this.#inFlightError = undefined;
+    this.#clearActiveSessionState();
     const client = this.#client;
     this.#client = undefined;
     if (client) {
@@ -495,9 +505,9 @@ export class AgyWorkerSlot {
     if (this.#client) {
       await this.#client.dispose();
     }
-    this.#activeAcpSessionId = undefined;
-    this.#activeRawModelId = undefined;
+    this.#clearActiveSessionState();
     this.#inFlightPrompt = undefined;
+    this.#inFlightError = undefined;
     const agyPath = resolveAgyBinary(cfg.agyPath);
     this.#client = new AcpWorkerClient({
       agyPath,
@@ -525,7 +535,7 @@ export class AgyWorkerSlot {
   ): Promise<void> {
     if (this.#activeAcpSessionId) {
       await client.closeSession(this.#activeAcpSessionId);
-      this.#activeAcpSessionId = undefined;
+      this.#clearActiveSessionState();
     }
 
     const created = await client.createSession({
@@ -565,10 +575,20 @@ export class AgyWorkerSlot {
     }
     this.#inFlightPrompt = undefined;
     this.#inFlightError = undefined;
-    if (closeExistingSession && this.#activeAcpSessionId && this.#client?.alive) {
-      await this.#client.closeSession(this.#activeAcpSessionId);
-      this.#activeAcpSessionId = undefined;
+    if (closeExistingSession) {
+      if (this.#activeAcpSessionId && this.#client?.alive) {
+        await this.#client.closeSession(this.#activeAcpSessionId);
+      }
+      this.#clearActiveSessionState();
     }
+  }
+
+  #clearActiveSessionState(): void {
+    this.#activeAcpSessionId = undefined;
+    this.#activeRawModelId = undefined;
+    this.#lastToolsFingerprint = undefined;
+    this.#lastContextDigests = undefined;
+    this.#lastHistoryPrefixDigest = undefined;
   }
 
   #attachPromptCompletion(

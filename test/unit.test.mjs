@@ -11,6 +11,7 @@ import {
   buildFullReplayPromptParts,
   classifyInBandAgyApiError,
   computeContextDigests,
+  computeHistoryPrefixDigest,
   computeToolsFingerprint,
   createSanitizedAgyEnv,
   formatHarnessGuidelines,
@@ -407,4 +408,361 @@ test('classifyInBandAgyApiError detects standalone agy 429/403 retry banners wit
     'Earlier we saw `⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): ...` in the logs.',
   );
   assert.equal(prose, undefined);
+});
+
+test('computeHistoryPrefixDigest ignores system/developer/notices and detects conversational mutations', () => {
+  const base = [
+    { role: 'system', content: [{ type: 'text', text: 'System v1' }] },
+    { id: 'dev-1', role: 'developer', content: [{ type: 'text', text: 'Task: step 1' }], source: { kind: 'developer' } },
+    { role: 'user', content: [{ type: 'text', text: 'Hello repo' }] },
+    {
+      id: 'a-1',
+      role: 'assistant',
+      content: [{ type: 'tool-call', id: 'tc-1', name: 'read', arguments: '{"file":"a.ts"}' }],
+      source: { provider: 'agy-acp', model: 'gemini-4-carbon' },
+    },
+    {
+      id: 't-1',
+      role: 'tool',
+      toolCallId: 'tc-1',
+      content: [{ type: 'text', text: 'export const x = 1;' }],
+      source: { kind: 'tool' },
+    },
+  ];
+
+  // Mutating system/developer, inserting ephemeral notices, or promoting RequestUserInput to durable Message with id must keep digest stable
+  const benignVariant = [
+    { role: 'system', content: [{ type: 'text', text: 'System v2' }] },
+    { id: 'dev-1', role: 'developer', content: [{ type: 'text', text: 'Task: step 1 DONE' }], source: { kind: 'developer' } },
+    { id: 'dev-2', role: 'developer', content: [{ type: 'text', text: 'Extra context surface' }], source: { kind: 'developer' } },
+    { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'Hello repo' }], source: { kind: 'user' } },
+    { role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 2, step 1: 2026-11-20T12:00:00Z' }] },
+    { role: 'user', content: [{ type: 'text', text: '<system-reminder>\nSkills\n</system-reminder>' }] },
+    base[3],
+    base[4],
+  ];
+  assert.equal(computeHistoryPrefixDigest(base), computeHistoryPrefixDigest(benignVariant));
+
+  // Tool result pruning (e.g. dsh-compaction-tool-result-pruner) changes digest
+  const prunedTool = [...base.slice(0, 4), { ...base[4], content: [{ type: 'text', text: '[... tool result pruned ...]' }] }];
+  assert.notEqual(computeHistoryPrefixDigest(base), computeHistoryPrefixDigest(prunedTool));
+
+  // Tool error flag flip changes digest
+  const erroredTool = [...base.slice(0, 4), { ...base[4], isError: true }];
+  assert.notEqual(computeHistoryPrefixDigest(base), computeHistoryPrefixDigest(erroredTool));
+
+  // Image offload (e.g. dsh-compaction-image-offload) changes digest even if text looks like a notice
+  const withImage = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: '<system-reminder>attached</system-reminder>' },
+        {
+          type: 'image',
+          attachment: { attachmentId: 'img-1', mediaType: 'image/png', bytes: 64, width: 10, height: 10 },
+        },
+      ],
+    },
+  ];
+  const offloadedImage = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: '<system-reminder>attached</system-reminder>' },
+        {
+          type: 'image',
+          offloaded: true,
+          attachment: { attachmentId: 'img-1', mediaType: 'image/png', bytes: 64, width: 10, height: 10 },
+        },
+      ],
+    },
+  ];
+  assert.notEqual(computeHistoryPrefixDigest(withImage), computeHistoryPrefixDigest(offloadedImage));
+});
+
+test('planSessionSync detects compacted/mutated history prefix before anchorIdx (billion-context) while preserving Context OS', () => {
+  const toolsFp = computeToolsFingerprint([{ name: 'read', description: 'Read', parameters: {} }]);
+
+  const devBefore = {
+    id: 'dev-1',
+    role: 'developer',
+    content: [{ type: 'text', text: 'Context OS: plan v1' }],
+    source: { kind: 'developer' },
+  };
+  const u1 = { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'Read file A' }], source: { kind: 'user' } };
+  const a1 = {
+    id: 'a-1',
+    role: 'assistant',
+    content: [{ type: 'tool-call', id: 'tc-1', name: 'read', arguments: '{"path":"a.ts"}' }],
+    source: { provider: 'agy-acp', model: 'gemini-4-carbon' },
+  };
+  const t1 = {
+    id: 't-1',
+    role: 'tool',
+    toolCallId: 'tc-1',
+    content: [{ type: 'text', text: 'const a = 1;' }],
+    source: { kind: 'tool' },
+  };
+  const u2 = { id: 'u-2', role: 'user', content: [{ type: 'text', text: 'Summarize A' }], source: { kind: 'user' } };
+
+  const prefixBeforeAnchor = [devBefore, u1, a1, t1, u2];
+  const savedPrefixDigest = computeHistoryPrefixDigest(prefixBeforeAnchor, prefixBeforeAnchor.length);
+  const savedContextDigests = computeContextDigests(prefixBeforeAnchor);
+
+  const anchor = {
+    id: 'a-anchor',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'File A exports constant a = 1.' }],
+    source: {
+      provider: 'agy-acp',
+      model: 'gemini-4-carbon',
+      replayState: {
+        response: {
+          version: 1,
+          acpSessionId: 'sess-1',
+          rawModelId: 'gemini-4-carbon-medium',
+          syncedMessageCount: prefixBeforeAnchor.length + 1,
+          toolsFingerprint: toolsFp,
+          contextDigests: savedContextDigests,
+          historyPrefixDigest: savedPrefixDigest,
+        },
+      },
+    },
+  };
+  const u3 = { id: 'u-3', role: 'user', content: [{ type: 'text', text: 'Next step?' }], source: { kind: 'user' } };
+
+  // 1. Range compaction (billion-context): replace u1/a1/t1 before anchorIdx with a summary node
+  const compactedSummary = {
+    id: 'summary-1',
+    role: 'user',
+    content: [{ type: 'text', text: '[Compressed conversation section] User inspected a.ts (a = 1).' }],
+    source: { kind: 'user' },
+  };
+  const compactedWarm = planSessionSync({
+    messages: [devBefore, compactedSummary, u2, anchor, u3],
+    activeAcpSessionId: 'sess-1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastContextDigests: savedContextDigests,
+    lastHistoryPrefixDigest: savedPrefixDigest,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.deepEqual(compactedWarm, {
+    kind: 'cold-full-replay',
+    reason: 'history-prefix-mutated-or-compacted',
+  });
+
+  // Compaction is also detected on resume-incremental (worker restarted, digest read from anchorReplay)
+  const compactedResume = planSessionSync({
+    messages: [devBefore, compactedSummary, u2, anchor, u3],
+    activeAcpSessionId: undefined,
+    currentToolsFingerprint: toolsFp,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.deepEqual(compactedResume, {
+    kind: 'cold-full-replay',
+    reason: 'history-prefix-mutated-or-compacted',
+  });
+
+  // 2. No regression for dsh-context-os: mutating only developer before anchorIdx stays warm-incremental
+  const devMutated = {
+    id: 'dev-1',
+    role: 'developer',
+    content: [{ type: 'text', text: 'Context OS: plan v2 (updated)' }],
+    source: { kind: 'developer' },
+  };
+  const contextOsDecision = planSessionSync({
+    messages: [devMutated, u1, a1, t1, u2, anchor, u3],
+    activeAcpSessionId: 'sess-1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastContextDigests: savedContextDigests,
+    lastHistoryPrefixDigest: savedPrefixDigest,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.equal(contextOsDecision.kind, 'warm-incremental');
+  assert.deepEqual(contextOsDecision.updatedContextBlocks, ['Context OS: plan v2 (updated)']);
+  assert.equal(contextOsDecision.tailMessages.length, 1);
+
+  // 3. Normal turn + ephemeral runtime notices before and after anchorIdx stays warm-incremental
+  const noticeBefore = {
+    role: 'user',
+    content: [{ type: 'text', text: 'Current runtime context. Working directory: /repo' }],
+  };
+  const noticeAfter = {
+    role: 'user',
+    content: [{ type: 'text', text: 'Time sampled while preparing turn 3, step 1: 2026-11-20T12:05:00Z' }],
+  };
+  const normalDecision = planSessionSync({
+    messages: [devBefore, u1, noticeBefore, a1, t1, u2, anchor, noticeAfter, u3],
+    activeAcpSessionId: 'sess-1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastContextDigests: savedContextDigests,
+    lastHistoryPrefixDigest: savedPrefixDigest,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.equal(normalDecision.kind, 'warm-incremental');
+  assert.equal(normalDecision.tailMessages.length, 2);
+
+  // 4. Warm rewind/fork to an earlier anchor triggers cold replay when slot digest is ahead of anchor
+  const laterSlotDigest = computeHistoryPrefixDigest([...prefixBeforeAnchor, anchor, u3]);
+  const rewindDecision = planSessionSync({
+    messages: [devBefore, u1, a1, t1, u2, anchor, u3],
+    activeAcpSessionId: 'sess-1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastContextDigests: savedContextDigests,
+    lastHistoryPrefixDigest: laterSlotDigest,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.deepEqual(rewindDecision, {
+    kind: 'cold-full-replay',
+    reason: 'history-prefix-mutated-or-compacted',
+  });
+
+  // 5. Stale slot digest must not poison resume-incremental when resuming a different/restarted session
+  const resumeWithStaleSlotState = planSessionSync({
+    messages: [devBefore, u1, a1, t1, u2, anchor, u3],
+    activeAcpSessionId: undefined,
+    lastToolsFingerprint: 'stale-tools-fp',
+    currentToolsFingerprint: toolsFp,
+    lastHistoryPrefixDigest: 'stale-prefix-digest',
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.equal(resumeWithStaleSlotState.kind, 'resume-incremental');
+  assert.equal(resumeWithStaleSlotState.resumeAcpSessionId, 'sess-1');
+});
+
+test('planSessionSync detects mid-turn compaction during resolve-pending-tools and stays backward compatible with legacy envelopes', () => {
+  const toolsFp = computeToolsFingerprint([{ name: 'compress', description: 'Compress', parameters: {} }]);
+
+  const dev = {
+    id: 'dev-1',
+    role: 'developer',
+    content: [{ type: 'text', text: 'Todo: compress old turns' }],
+    source: { kind: 'developer' },
+  };
+  const u1 = { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'Old turn 1' }], source: { kind: 'user' } };
+  const a1 = { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'Old answer 1' }], source: { provider: 'agy-acp', model: 'gemini-4-carbon' } };
+  const u2 = { id: 'u-2', role: 'user', content: [{ type: 'text', text: 'Now compress and inspect' }], source: { kind: 'user' } };
+
+  const prefixBeforeToolTurn = [dev, u1, a1, u2];
+  const savedPrefixDigest = computeHistoryPrefixDigest(prefixBeforeToolTurn, prefixBeforeToolTurn.length);
+
+  const asstTool = {
+    id: 'a-tool',
+    role: 'assistant',
+    content: [{ type: 'tool-call', id: 'tc-compress', name: 'compress', arguments: '{}' }],
+    source: {
+      provider: 'agy-acp',
+      model: 'gemini-4-carbon',
+      replayState: {
+        response: {
+          version: 1,
+          acpSessionId: 'sess-mid-1',
+          rawModelId: 'gemini-4-carbon-medium',
+          syncedMessageCount: prefixBeforeToolTurn.length + 1,
+          toolsFingerprint: toolsFp,
+          historyPrefixDigest: savedPrefixDigest,
+        },
+      },
+    },
+  };
+  const toolRes = {
+    id: 't-res',
+    role: 'tool',
+    toolCallId: 'tc-compress',
+    content: [{ type: 'text', text: 'Compressed range m00001-m00002.' }],
+    source: { kind: 'tool' },
+  };
+
+  // Mid-turn developer mutation alone still resolves pending tools warmly
+  const devUpdated = { ...dev, content: [{ type: 'text', text: 'Todo: step 2 in progress' }] };
+  const devOnlyMidTurn = planSessionSync({
+    messages: [devUpdated, u1, a1, u2, asstTool, toolRes],
+    activeAcpSessionId: 'sess-mid-1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastHistoryPrefixDigest: savedPrefixDigest,
+    pendingToolCallIds: new Set(['tc-compress']),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.equal(devOnlyMidTurn.kind, 'resolve-pending-tools');
+
+  // Mid-turn range compaction replaces [u1, a1] with summary node while tc-compress is pending -> cold-full-replay
+  const summaryNode = {
+    id: 'sum-mid',
+    role: 'user',
+    content: [{ type: 'text', text: '[Compressed conversation section] Old turn 1 summary' }],
+    source: { kind: 'user' },
+  };
+  const compactedMidTurn = planSessionSync({
+    messages: [dev, summaryNode, u2, asstTool, toolRes],
+    activeAcpSessionId: 'sess-mid-1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastHistoryPrefixDigest: savedPrefixDigest,
+    pendingToolCallIds: new Set(['tc-compress']),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.deepEqual(compactedMidTurn, {
+    kind: 'cold-full-replay',
+    reason: 'history-prefix-mutated-or-compacted',
+  });
+
+  // Backward compatibility: legacy ReplayEnvelope without historyPrefixDigest must NOT force cold replay
+  const legacyAnchor = {
+    id: 'a-legacy',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Legacy answer' }],
+    source: {
+      provider: 'agy-acp',
+      model: 'gemini-4-carbon',
+      replayState: {
+        response: {
+          version: 1,
+          acpSessionId: 'sess-legacy',
+          rawModelId: 'gemini-4-carbon-medium',
+          syncedMessageCount: 2,
+          toolsFingerprint: toolsFp,
+        },
+      },
+    },
+  };
+  const legacyWarm = planSessionSync({
+    messages: [u1, legacyAnchor, u2],
+    activeAcpSessionId: 'sess-legacy',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.equal(legacyWarm.kind, 'warm-incremental');
+
+  const legacyResume = planSessionSync({
+    messages: [u1, legacyAnchor, u2],
+    activeAcpSessionId: undefined,
+    currentToolsFingerprint: toolsFp,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    forwardContextUpdates: true,
+  });
+  assert.equal(legacyResume.kind, 'resume-incremental');
+  assert.equal(legacyResume.resumeAcpSessionId, 'sess-legacy');
 });
