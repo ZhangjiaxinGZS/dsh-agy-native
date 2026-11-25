@@ -216,12 +216,70 @@ rl.on('line', async (line) => {
         method: 'session/update',
         params: {
           sessionId,
+          update: { sessionUpdate: 'usage_update', used: 938, size: 1048576 },
+        },
+      });
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
           update: {
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: `Combined=${combined}` },
           },
         },
       });
+    } else if (textJoined.includes('CALL_SIX_STEP_LOOP') && sess.mcpServer) {
+      // Simulate 5 sequential tool steps (~180k context each) + final step 6 (cumulative > 1M window!)
+      for (let i = 1; i <= 5; i++) {
+        send({
+          method: 'session/update',
+          params: {
+            sessionId,
+            update: { sessionUpdate: 'usage_update', used: 180_000 + i * 2_000, size: 1048576 },
+          },
+        });
+        const r = await callMcp(sess.mcpServer, 'tools/call', {
+          name: 'get_left',
+          arguments: { q: `step-${i}` },
+        });
+        if (sess.cancelled || r?.error || !r?.result) {
+          send({ id: msg.id, result: { stopReason: 'cancelled' } });
+          return;
+        }
+      }
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 192_000, size: 1048576 },
+        },
+      });
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Six-step loop complete' },
+          },
+        },
+      });
+      send({
+        id: msg.id,
+        result: {
+          stopReason: 'end_turn',
+          usage: {
+            inputTokens: 19_200,
+            outputTokens: 3_600,
+            cachedReadTokens: 1_099_200,
+            cachedWriteTokens: 0,
+            thoughtTokens: 1_200,
+            totalTokens: 1_122_000,
+          },
+        },
+      });
+      return;
     } else {
       const imgTag = imagePart ? ` [img:${imagePart.mimeType}:${imagePart.data.length}]` : '';
       const echoTag = textJoined.includes('ECHO_PROMPT')

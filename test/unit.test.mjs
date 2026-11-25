@@ -14,10 +14,13 @@ import {
   computeContextDigests,
   computeHistoryPrefixDigest,
   computeToolsFingerprint,
+  createInFlightTurnUsageState,
   createSanitizedAgyEnv,
   encodeMcpToolName,
+  estimateIntermediateStepUsage,
   formatHarnessGuidelines,
   planSessionSync,
+  reconcileFinalStepUsage,
   resolveAgyBinary,
   sanitizeMcpToolArguments,
   supportsProcessPerSession,
@@ -877,4 +880,64 @@ test('planSessionSync detects mid-turn compaction during resolve-pending-tools a
   });
   assert.equal(legacyResume.kind, 'resume-incremental');
   assert.equal(legacyResume.resumeAcpSessionId, 'sess-legacy');
+});
+
+test('reconcileFinalStepUsage preserves exact cumulative billing while keeping final-step context occupancy single-step', () => {
+  // Warm 6-step turn where prior turn established cachedPromptBaseline = 175_000
+  const turnState = createInFlightTurnUsageState();
+  let baseline = 175_000;
+  const emitted = [];
+
+  for (const used of [180_000, 182_000, 184_000, 186_000, 188_000]) {
+    turnState.toolBatchCount += 1;
+    const { usage, nextCachedPromptBaseline } = estimateIntermediateStepUsage({
+      stepUsedTokens: used,
+      emittedOutputChars: 800,
+      cachedPromptBaseline: baseline,
+    });
+    baseline = nextCachedPromptBaseline;
+    turnState.emittedInput += usage.inputTokens;
+    turnState.emittedOutput += usage.outputTokens;
+    turnState.emittedCacheRead += usage.cacheReadTokens ?? 0;
+    turnState.emittedSteps += 1;
+    emitted.push(usage);
+  }
+
+  turnState.lastStepUsed = 190_000;
+  const { usage: finalUsage } = reconcileFinalStepUsage(
+    {
+      inputTokens: 19_223,
+      outputTokens: 3_745,
+      cachedReadTokens: 1_089_736,
+      cachedWriteTokens: 0,
+      thoughtTokens: 2_404,
+      totalTokens: 1_112_704,
+    },
+    turnState,
+  );
+
+  assert.ok(finalUsage);
+  const all = [...emitted, finalUsage];
+  const totalPrompt = all.reduce((s, u) => s + u.inputTokens + (u.cacheReadTokens ?? 0), 0);
+  const totalOut = all.reduce((s, u) => s + u.outputTokens, 0);
+  assert.equal(totalPrompt, 19_223 + 1_089_736);
+  assert.equal(totalOut, 3_745);
+
+  const finalPressure = finalUsage.inputTokens + (finalUsage.cacheReadTokens ?? 0);
+  assert.ok(finalPressure < 220_000, `Final step pressure (${finalPressure}) must stay ~19%, never 1.1M`);
+
+  // Fallback when an older binary emits zero intermediate usage_update frames during tool batches
+  const noUpdatesState = createInFlightTurnUsageState();
+  noUpdatesState.toolBatchCount = 5;
+  const { usage: fallbackUsage } = reconcileFinalStepUsage(
+    {
+      inputTokens: 18_000,
+      outputTokens: 3_600,
+      cachedReadTokens: 1_080_000,
+      totalTokens: 1_101_600,
+    },
+    noUpdatesState,
+  );
+  assert.ok(fallbackUsage);
+  assert.equal(fallbackUsage.inputTokens + (fallbackUsage.cacheReadTokens ?? 0), 183_000);
 });

@@ -65,7 +65,11 @@ export {
 export {
   AgyWorkerPool,
   AgyWorkerSlot,
+  createInFlightTurnUsageState,
+  estimateIntermediateStepUsage,
   mapAcpUsageToDsh,
+  reconcileFinalStepUsage,
+  type InFlightTurnUsageState,
 } from './worker-pool.js';
 
 export { AgyAcpAdapter } from './adapter.js';

@@ -78,14 +78,24 @@ class AsyncEventQueue<T> {
 
 export function mapAcpUsageToDsh(usage?: AcpPromptUsage): TokenUsage | undefined {
   if (!usage) return undefined;
-  const inputTokens = Math.max(0, usage.inputTokens ?? 0);
-  const outputTokens = Math.max(0, usage.outputTokens ?? 0);
-  const cacheReadTokens = usage.cachedReadTokens;
-  const cacheWriteTokens = usage.cachedWriteTokens;
-  const reasoningTokens = usage.thoughtTokens;
+  const inputTokens = Math.max(0, Math.round(usage.inputTokens ?? 0));
+  const outputTokens = Math.max(0, Math.round(usage.outputTokens ?? 0));
+  const cacheReadTokens =
+    typeof usage.cachedReadTokens === 'number'
+      ? Math.max(0, Math.round(usage.cachedReadTokens))
+      : undefined;
+  const cacheWriteTokens =
+    typeof usage.cachedWriteTokens === 'number'
+      ? Math.max(0, Math.round(usage.cachedWriteTokens))
+      : undefined;
+  const reasoningTokens =
+    typeof usage.thoughtTokens === 'number'
+      ? Math.max(0, Math.round(usage.thoughtTokens))
+      : undefined;
   const totalTokens =
-    usage.totalTokens ??
-    inputTokens + outputTokens + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0);
+    typeof usage.totalTokens === 'number'
+      ? Math.max(0, Math.round(usage.totalTokens))
+      : inputTokens + outputTokens + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0);
 
   return {
     inputTokens,
@@ -94,6 +104,163 @@ export function mapAcpUsageToDsh(usage?: AcpPromptUsage): TokenUsage | undefined
     ...(typeof cacheReadTokens === 'number' ? { cacheReadTokens } : {}),
     ...(typeof cacheWriteTokens === 'number' ? { cacheWriteTokens } : {}),
     ...(typeof reasoningTokens === 'number' ? { reasoningTokens } : {}),
+  };
+}
+
+export interface InFlightTurnUsageState {
+  emittedInput: number;
+  emittedOutput: number;
+  emittedCacheRead: number;
+  emittedCacheWrite: number;
+  emittedSteps: number;
+  toolBatchCount: number;
+  pendingStepUsed?: number;
+  lastStepUsed?: number;
+}
+
+export function createInFlightTurnUsageState(): InFlightTurnUsageState {
+  return {
+    emittedInput: 0,
+    emittedOutput: 0,
+    emittedCacheRead: 0,
+    emittedCacheWrite: 0,
+    emittedSteps: 0,
+    toolBatchCount: 0,
+  };
+}
+
+/**
+ * Estimate single-step `TokenUsage` for an intermediate tool-calling step (`j < K`)
+ * from ACP's real-time `usage_update.used` count so DSH's context-occupancy meter
+ * reflects single-step context pressure while preserving cumulative session totals.
+ */
+export function estimateIntermediateStepUsage(opts: {
+  stepUsedTokens: number;
+  emittedOutputChars: number;
+  cachedPromptBaseline: number;
+}): { usage: TokenUsage; nextCachedPromptBaseline: number } {
+  const stepUsed = Math.max(0, Math.round(opts.stepUsedTokens));
+  const estOutput = Math.min(
+    Math.floor(stepUsed * 0.25),
+    Math.max(1, Math.ceil(Math.max(0, opts.emittedOutputChars) / 4)),
+  );
+  const stepPrompt = Math.max(0, stepUsed - estOutput);
+  const baseline = Math.max(0, Math.round(opts.cachedPromptBaseline));
+  const stepCacheRead = Math.min(stepPrompt, baseline);
+  const stepInput = stepPrompt - stepCacheRead;
+  const nextCachedPromptBaseline = Math.max(baseline, Math.floor(stepPrompt * 0.8));
+
+  return {
+    usage: {
+      inputTokens: stepInput,
+      outputTokens: estOutput,
+      totalTokens: stepUsed,
+      ...(stepCacheRead > 0 ? { cacheReadTokens: stepCacheRead } : {}),
+    },
+    nextCachedPromptBaseline,
+  };
+}
+
+/**
+ * Reconcile ACP's cumulative `session/prompt` end-of-turn usage against intermediate
+ * step usages emitted during tool loops so that:
+ * 1. Across steps `1..K`, `sum(step.usage)` equals ACP's cumulative turn totals;
+ * 2. Final step `K` reports only step `K`'s single-step prompt size (avoiding `K × context` 100% spikes).
+ */
+export function reconcileFinalStepUsage(
+  rawUsage: AcpPromptUsage | undefined,
+  turnState: InFlightTurnUsageState | undefined,
+): { usage: TokenUsage | undefined; nextCachedPromptBaseline: number } {
+  const full = mapAcpUsageToDsh(rawUsage);
+  if (!full) {
+    return { usage: undefined, nextCachedPromptBaseline: 0 };
+  }
+
+  const fullCacheRead = full.cacheReadTokens ?? 0;
+  const fullCacheWrite = full.cacheWriteTokens ?? 0;
+  const fullInput = full.inputTokens;
+  const fullOutput = full.outputTokens;
+  const fullPrompt = fullInput + fullCacheRead + fullCacheWrite;
+  const totalSteps = (turnState?.toolBatchCount ?? 0) + 1;
+
+  if (!turnState || totalSteps <= 1) {
+    return {
+      usage: full,
+      nextCachedPromptBaseline: Math.floor(fullPrompt * 0.85),
+    };
+  }
+
+  if (turnState.emittedSteps === 0) {
+    const targetPrompt =
+      turnState.lastStepUsed && turnState.lastStepUsed > 0
+        ? Math.min(
+            fullPrompt,
+            Math.max(0, Math.round(turnState.lastStepUsed - fullOutput / totalSteps)),
+          )
+        : Math.round(fullPrompt / totalSteps);
+    const scale = fullPrompt > 0 ? targetPrompt / fullPrompt : 0;
+    const stepCacheRead = Math.round(fullCacheRead * scale);
+    const stepCacheWrite = Math.round(fullCacheWrite * scale);
+    const stepInput = Math.max(0, targetPrompt - stepCacheRead - stepCacheWrite);
+    const stepOutput = Math.round(fullOutput / totalSteps);
+    return {
+      usage: {
+        inputTokens: stepInput,
+        outputTokens: stepOutput,
+        totalTokens: targetPrompt + stepOutput,
+        ...(typeof full.cacheReadTokens === 'number' ? { cacheReadTokens: stepCacheRead } : {}),
+        ...(typeof full.cacheWriteTokens === 'number' ? { cacheWriteTokens: stepCacheWrite } : {}),
+        ...(typeof full.reasoningTokens === 'number'
+          ? { reasoningTokens: full.reasoningTokens }
+          : {}),
+      },
+      nextCachedPromptBaseline: Math.floor(targetPrompt * 0.85),
+    };
+  }
+
+  const emittedPrompt =
+    turnState.emittedInput + turnState.emittedCacheRead + turnState.emittedCacheWrite;
+  const missedIntermediateSteps = Math.max(0, turnState.toolBatchCount - turnState.emittedSteps);
+  let targetPrompt = Math.max(0, fullPrompt - emittedPrompt);
+  if (missedIntermediateSteps > 0) {
+    targetPrompt =
+      turnState.lastStepUsed && turnState.lastStepUsed > 0
+        ? Math.min(targetPrompt, Math.round(turnState.lastStepUsed))
+        : Math.round(targetPrompt / (missedIntermediateSteps + 1));
+  }
+
+  let remInput = Math.max(0, fullInput - turnState.emittedInput);
+  let remCacheRead = Math.max(0, fullCacheRead - turnState.emittedCacheRead);
+  let remCacheWrite = Math.max(0, fullCacheWrite - turnState.emittedCacheWrite);
+  const remPromptSum = remInput + remCacheRead + remCacheWrite;
+
+  if (remPromptSum > targetPrompt && remPromptSum > 0) {
+    const scale = targetPrompt / remPromptSum;
+    remCacheRead = Math.round(remCacheRead * scale);
+    remCacheWrite = Math.round(remCacheWrite * scale);
+    remInput = Math.max(0, targetPrompt - remCacheRead - remCacheWrite);
+  }
+
+  const remOutput = Math.max(0, fullOutput - turnState.emittedOutput);
+  const stepPrompt = remInput + remCacheRead + remCacheWrite;
+
+  return {
+    usage: {
+      inputTokens: remInput,
+      outputTokens: remOutput,
+      totalTokens: stepPrompt + remOutput,
+      ...(typeof full.cacheReadTokens === 'number' || remCacheRead > 0
+        ? { cacheReadTokens: remCacheRead }
+        : {}),
+      ...(typeof full.cacheWriteTokens === 'number' || remCacheWrite > 0
+        ? { cacheWriteTokens: remCacheWrite }
+        : {}),
+      ...(typeof full.reasoningTokens === 'number'
+        ? { reasoningTokens: full.reasoningTokens }
+        : {}),
+    },
+    nextCachedPromptBaseline:
+      fullCacheRead > 0 || stepPrompt > 0 ? Math.floor(stepPrompt * 0.85) : 0,
   };
 }
 
@@ -115,7 +282,9 @@ export class AgyWorkerSlot {
   #lastToolsFingerprint?: string;
   #lastContextDigests?: Record<string, string>;
   #lastHistoryPrefixDigest?: string;
+  #cachedPromptBaseline = 0;
   #inFlightPrompt?: Promise<AcpPromptResponse>;
+  #inFlightTurnUsage?: InFlightTurnUsageState;
   #inFlightError?: Error;
 
   #busy = false;
@@ -184,10 +353,14 @@ export class AgyWorkerSlot {
 
     this.#clearIdleTimer();
     this.#busy = true;
-    this.#lastUsedAt = Date.now();
+    const now = Date.now();
+    if (now - this.#lastUsedAt > 270_000) {
+      this.#cachedPromptBaseline = 0;
+    }
+    this.#lastUsedAt = now;
 
     const cfg = this.#getConfig();
-    const targetRawModelId = this.#catalog.resolveRawModelId(
+    let targetRawModelId = this.#catalog.resolveRawModelId(
       options.model,
       options.reasoningEffort,
     );
@@ -221,8 +394,12 @@ export class AgyWorkerSlot {
       client.setStreamCallbacks({
         onThoughtDelta: (text) => queue.push({ kind: 'thought', text }),
         onTextDelta: (text) => queue.push({ kind: 'text', text }),
-        onUsageUpdate: (_used, size) => {
+        onUsageUpdate: (used, size) => {
           this.#catalog.recordContextWindow(targetRawModelId, size);
+          if (used > 0 && this.#inFlightTurnUsage) {
+            this.#inFlightTurnUsage.pendingStepUsed = used;
+            this.#inFlightTurnUsage.lastStepUsed = used;
+          }
         },
       });
 
@@ -244,6 +421,7 @@ export class AgyWorkerSlot {
           if (this.#inFlightError) {
             const staleErr = this.#inFlightError;
             this.#inFlightPrompt = undefined;
+            this.#inFlightTurnUsage = undefined;
             this.#inFlightError = undefined;
             throw staleErr;
           }
@@ -303,7 +481,7 @@ export class AgyWorkerSlot {
               const routing = formatHarnessGuidelines(undefined, routingBridgeToolNames ?? false);
               if (routing) promptParts.unshift({ type: 'text', text: routing });
             } else {
-              await this.#openFreshSession(client, endpoint, targetRawModelId, cfg);
+              targetRawModelId = await this.#openFreshSession(client, endpoint, options, cfg);
               promptParts = await buildFullReplayPromptParts({
                 messages: options.messages,
                 systemPrompt,
@@ -313,7 +491,7 @@ export class AgyWorkerSlot {
               });
             }
           } else {
-            await this.#openFreshSession(client, endpoint, targetRawModelId, cfg);
+            targetRawModelId = await this.#openFreshSession(client, endpoint, options, cfg);
             promptParts = await buildFullReplayPromptParts({
               messages: options.messages,
               systemPrompt,
@@ -323,6 +501,7 @@ export class AgyWorkerSlot {
             });
           }
 
+          this.#inFlightTurnUsage = createInFlightTurnUsageState();
           const promptPromise = client.prompt(
             this.#activeAcpSessionId!,
             promptParts,
@@ -339,6 +518,7 @@ export class AgyWorkerSlot {
 
         // Stream events out as DSH StreamChunks
         let nextBlockIndex = 0;
+        let stepOutputChars = 0;
         let openBlock:
           | { index: number; type: 'reasoning' | 'text'; text: string }
           | undefined;
@@ -391,6 +571,7 @@ export class AgyWorkerSlot {
               yield { type: 'block-start', index: openBlock.index, blockType: 'reasoning' };
             }
             openBlock.text += ev.text;
+            stepOutputChars += ev.text.length;
             yield { type: 'reasoning-delta', index: openBlock.index, text: ev.text };
             continue;
           }
@@ -404,6 +585,7 @@ export class AgyWorkerSlot {
               yield { type: 'block-start', index: openBlock.index, blockType: 'text' };
             }
             openBlock.text += ev.text;
+            stepOutputChars += ev.text.length;
             yield { type: 'text-delta', index: openBlock.index, text: ev.text };
             continue;
           }
@@ -415,6 +597,7 @@ export class AgyWorkerSlot {
             for (const call of ev.calls) {
               const idx = nextBlockIndex++;
               const callId = ToolCallId(call.toolCallId);
+              stepOutputChars += call.toolName.length + call.argumentsJson.length;
               yield { type: 'block-start', index: idx, blockType: 'tool-call' };
               yield {
                 type: 'tool-call-delta',
@@ -435,6 +618,28 @@ export class AgyWorkerSlot {
               };
             }
 
+            const turnUsage = this.#inFlightTurnUsage;
+            if (turnUsage) {
+              turnUsage.toolBatchCount += 1;
+              if (turnUsage.pendingStepUsed !== undefined && turnUsage.pendingStepUsed > 0) {
+                const stepUsed = turnUsage.pendingStepUsed;
+                turnUsage.pendingStepUsed = undefined;
+                const { usage: stepUsage, nextCachedPromptBaseline } =
+                  estimateIntermediateStepUsage({
+                    stepUsedTokens: stepUsed,
+                    emittedOutputChars: stepOutputChars,
+                    cachedPromptBaseline: this.#cachedPromptBaseline,
+                  });
+                this.#cachedPromptBaseline = nextCachedPromptBaseline;
+                turnUsage.emittedInput += stepUsage.inputTokens;
+                turnUsage.emittedOutput += stepUsage.outputTokens;
+                turnUsage.emittedCacheRead += stepUsage.cacheReadTokens ?? 0;
+                turnUsage.emittedCacheWrite += stepUsage.cacheWriteTokens ?? 0;
+                turnUsage.emittedSteps += 1;
+                yield { type: 'usage', usage: stepUsage };
+              }
+            }
+
             yield {
               type: 'finish',
               reason: { kind: 'tool-calls' },
@@ -445,13 +650,19 @@ export class AgyWorkerSlot {
           }
 
           if (ev.kind === 'prompt-done') {
+            const turnUsage = this.#inFlightTurnUsage;
+            this.#inFlightTurnUsage = undefined;
             this.#inFlightPrompt = undefined;
             this.#inFlightError = undefined;
             const closed = closeOpenBlock();
             if (closed) yield closed;
 
-            const usage = mapAcpUsageToDsh(ev.response.usage);
+            const { usage, nextCachedPromptBaseline } = reconcileFinalStepUsage(
+              ev.response.usage,
+              turnUsage,
+            );
             if (usage) {
+              this.#cachedPromptBaseline = nextCachedPromptBaseline;
               yield { type: 'usage', usage };
             }
 
@@ -470,6 +681,7 @@ export class AgyWorkerSlot {
           }
 
           if (ev.kind === 'aborted') {
+            this.#inFlightTurnUsage = undefined;
             this.#inFlightPrompt = undefined;
             this.#inFlightError = undefined;
             queue.close();
@@ -477,6 +689,7 @@ export class AgyWorkerSlot {
           }
 
           if (ev.kind === 'error') {
+            this.#inFlightTurnUsage = undefined;
             this.#inFlightPrompt = undefined;
             this.#inFlightError = undefined;
             queue.close();
@@ -499,6 +712,7 @@ export class AgyWorkerSlot {
     this.#clearIdleTimer();
     this.#endpoint?.dispose();
     this.#endpoint = undefined;
+    this.#inFlightTurnUsage = undefined;
     this.#inFlightPrompt = undefined;
     this.#inFlightError = undefined;
     this.#clearActiveSessionState();
@@ -515,6 +729,7 @@ export class AgyWorkerSlot {
       await this.#client.dispose();
     }
     this.#clearActiveSessionState();
+    this.#inFlightTurnUsage = undefined;
     this.#inFlightPrompt = undefined;
     this.#inFlightError = undefined;
     const agyPath = resolveAgyBinary(cfg.agyPath);
@@ -540,9 +755,9 @@ export class AgyWorkerSlot {
   async #openFreshSession(
     client: AcpWorkerClient,
     endpoint: McpSessionEndpoint,
-    targetRawModelId: string,
+    options: Pick<GenerateOptions<string>, 'model' | 'reasoningEffort'>,
     cfg: ResolvedAgyAcpConfig,
-  ): Promise<void> {
+  ): Promise<string> {
     if (this.#activeAcpSessionId) {
       await client.closeSession(this.#activeAcpSessionId);
       this.#clearActiveSessionState();
@@ -556,6 +771,11 @@ export class AgyWorkerSlot {
     if (created.availableModels.length > 0) {
       this.#catalog.update(created.availableModels, created.tier);
     }
+
+    const targetRawModelId = this.#catalog.resolveRawModelId(
+      options.model,
+      options.reasoningEffort,
+    );
 
     const modelAvailable =
       created.availableModels.length === 0 ||
@@ -572,6 +792,7 @@ export class AgyWorkerSlot {
 
     this.#activeAcpSessionId = created.sessionId;
     this.#activeRawModelId = targetRawModelId;
+    return targetRawModelId;
   }
 
   async #abortInFlightTurn(closeExistingSession: boolean): Promise<void> {
@@ -583,6 +804,7 @@ export class AgyWorkerSlot {
         new Promise<void>((r) => setTimeout(r, 500)),
       ]);
     }
+    this.#inFlightTurnUsage = undefined;
     this.#inFlightPrompt = undefined;
     this.#inFlightError = undefined;
     if (closeExistingSession) {
@@ -599,6 +821,7 @@ export class AgyWorkerSlot {
     this.#lastToolsFingerprint = undefined;
     this.#lastContextDigests = undefined;
     this.#lastHistoryPrefixDigest = undefined;
+    this.#cachedPromptBaseline = 0;
   }
 
   #attachPromptCompletion(

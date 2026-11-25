@@ -127,11 +127,20 @@ test('AgyAcpAdapter streams reasoning, parallel tool-calls, warm continuation, i
     const step2Text = step2Chunks.find((c) => c.type === 'block-end' && c.block.type === 'text');
     assert.equal(step2Text?.block.text, 'Combined=ALPHA+BETA');
 
+    const step1Usage = step1Chunks.find((c) => c.type === 'usage');
     const step2Usage = step2Chunks.find((c) => c.type === 'usage');
-    assert.equal(step2Usage?.usage.inputTokens, 1000);
-    assert.equal(step2Usage?.usage.cacheReadTokens, 400);
-    assert.equal(step2Usage?.usage.reasoningTokens, 15);
-    assert.equal(step2Usage?.usage.totalTokens, 1450);
+    assert.ok(step1Usage, 'Intermediate tool step emits single-step usage from usage_update');
+    assert.ok(step2Usage, 'Final step emits reconciled remainder usage');
+    assert.equal(step1Usage.usage.totalTokens, 512);
+    assert.equal(step1Usage.usage.inputTokens + step2Usage.usage.inputTokens, 1000);
+    assert.equal(step1Usage.usage.outputTokens + step2Usage.usage.outputTokens, 50);
+    assert.equal((step1Usage.usage.cacheReadTokens ?? 0) + (step2Usage.usage.cacheReadTokens ?? 0), 400);
+    assert.equal(step1Usage.usage.totalTokens + step2Usage.usage.totalTokens, 1450);
+    assert.equal(step2Usage.usage.reasoningTokens, 15);
+    assert.ok(
+      step2Usage.usage.inputTokens + (step2Usage.usage.cacheReadTokens ?? 0) < 1000,
+      'Final step prompt pressure reflects step 2 alone rather than step1+step2 sum',
+    );
 
     const step2Finish = step2Chunks.find((c) => c.type === 'finish');
     assert.equal(step2Finish?.reason.kind, 'stop');
@@ -494,6 +503,90 @@ test('AgyAcpAdapter resets ACP session on prefix compaction (between turns and m
     } finally {
       await resumedAdapter.dispose();
     }
+  } finally {
+    await adapter.dispose();
+    fs.rmSync(tmpCache, { recursive: true, force: true });
+  }
+});
+
+test('AgyAcpAdapter decomposes 6-step tool-loop usage so context occupancy stays ~18% instead of spiking to 100%', async () => {
+  const tmpCache = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-usage-test-'));
+  const cfg = resolveAgyAcpConfig({
+    agyPath: FAKE_AGY_PATH,
+    poolSize: 1,
+    batchWindowMs: 10,
+    cacheDir: tmpCache,
+  });
+  const adapter = new AgyAcpAdapter({ getConfig: () => cfg });
+
+  try {
+    const tools = [
+      { name: 'get_left', description: 'Left', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+    ];
+    const messages = [
+      {
+        id: 'u-loop',
+        role: 'user',
+        content: [{ type: 'text', text: 'Run CALL_SIX_STEP_LOOP' }],
+        source: { kind: 'user' },
+      },
+    ];
+
+    const stepUsages = [];
+    let finishKind = 'tool-calls';
+    let step = 0;
+
+    while (finishKind === 'tool-calls' && step++ < 10) {
+      const chunks = await collectChunks(
+        adapter.stream({
+          provider: 'agy-acp',
+          model: 'gemini-4-carbon',
+          sessionId: 'dsh-usage-loop',
+          messages,
+          tools,
+        }),
+      );
+      const usageChunk = chunks.find((c) => c.type === 'usage');
+      assert.ok(usageChunk, `Expected usage chunk on step ${step}`);
+      stepUsages.push(usageChunk.usage);
+
+      const finish = chunks.find((c) => c.type === 'finish');
+      finishKind = finish.reason.kind;
+      const blocks = chunks.filter((c) => c.type === 'block-end').map((c) => c.block);
+      messages.push({
+        id: `a-loop-${step}`,
+        role: 'assistant',
+        content: blocks,
+        source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: finish.replayState },
+      });
+      if (finishKind === 'tool-calls') {
+        for (const tc of blocks.filter((b) => b.type === 'tool-call')) {
+          messages.push({
+            id: `t-loop-${step}`,
+            role: 'tool',
+            toolCallId: tc.id,
+            content: [{ type: 'text', text: `ok-${step}` }],
+            source: { kind: 'tool' },
+          });
+        }
+      }
+    }
+
+    assert.equal(finishKind, 'stop');
+    assert.equal(stepUsages.length, 6);
+
+    // Every single step (including step 6) keeps prompt pressure ~180k-250k (< 25% of 1M), never 1.12M (100%)
+    for (const u of stepUsages) {
+      const pressure = u.inputTokens + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0);
+      assert.ok(pressure > 150_000 && pressure < 250_000, `Unexpected single-step pressure: ${pressure}`);
+    }
+
+    // Total prompt tokens across all 6 steps equals ACP's exact cumulative prompt total (19,200 + 1,099,200 = 1,118,400)
+    const sumPrompt = stepUsages.reduce(
+      (acc, u) => acc + u.inputTokens + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0),
+      0,
+    );
+    assert.equal(sumPrompt, 1_118_400);
   } finally {
     await adapter.dispose();
     fs.rmSync(tmpCache, { recursive: true, force: true });
