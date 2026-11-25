@@ -163,7 +163,12 @@ export function supportsProcessPerSession(agyPath: string): Promise<boolean> {
     timeout: 4000,
   }).then(
     ({ stdout, stderr }) => /^\s*--process-per-session(?:\s|$)/m.test(stdout + '\n' + stderr),
-    () => false,
+    (err: NodeJS.ErrnoException & { killed?: boolean; signal?: NodeJS.Signals | null }) => {
+      if (err?.killed || err?.signal) {
+        acpSessionWorkers.delete(agyPath);
+      }
+      return false;
+    },
   );
   acpSessionWorkers.set(agyPath, supported);
   return supported;

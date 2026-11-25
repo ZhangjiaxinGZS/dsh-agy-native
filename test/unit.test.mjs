@@ -20,6 +20,7 @@ import {
   planSessionSync,
   resolveAgyBinary,
   sanitizeMcpToolArguments,
+  supportsProcessPerSession,
   truncateToolOutputUtf8,
 } from '../dist/core.js';
 
@@ -409,15 +410,42 @@ test('workspace guidelines match the registered bridge names, including PTC-only
   const standard = await prompt();
   assert.equal(new Set(endpoint.bridgeToolNames).size, 2);
   for (const name of endpoint.bridgeToolNames) assert.ok(standard.includes(`mcp_dsh_${name}`));
+  assert.match(standard, /brain\//);
   assert.doesNotMatch(standard, /mcp_dsh_read|mcp_dsh_run_code/);
   setTools(['run_code']);
   const ptc = await prompt();
   assert.match(ptc, /mcp_dsh_run_code/);
   assert.match(ptc, /exact DSH tool names in the supplied SDK/);
   assert.match(ptc, /ambient MCP servers/);
+  assert.match(ptc, /brain\//);
   assert.doesNotMatch(ptc, /issue_search/);
   setTools([]);
-  assert.match(await prompt(), /No DSH tools/);
+  const empty = await prompt();
+  assert.match(empty, /No DSH tools/);
+  assert.match(empty, /brain\//);
+  assert.doesNotMatch(empty, /mcp_dsh_\*/);
+});
+
+test('supportsProcessPerSession detects --process-per-session flag and falls back on older binaries', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-help-probe-'));
+  const modernBin = path.join(dir, 'agy-modern');
+  const legacyBin = path.join(dir, 'agy-legacy');
+  fs.writeFileSync(
+    modernBin,
+    '#!/usr/bin/env node\nconsole.log("  --process-per-session  Serve each session from an isolated worker process");\n',
+    { mode: 0o755 },
+  );
+  fs.writeFileSync(
+    legacyBin,
+    '#!/usr/bin/env node\nconsole.log("  --stdio  Use stdio JSON-RPC transport");\n',
+    { mode: 0o755 },
+  );
+  try {
+    assert.equal(await supportsProcessPerSession(modernBin), true);
+    assert.equal(await supportsProcessPerSession(legacyBin), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('an existing literal MCP name is preserved when an encoded collision needs the same suffix', () => {

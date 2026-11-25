@@ -88,6 +88,14 @@ dsh plugin --profile web add -w ./dsh-agy-native-0.1.0.tgz
 
 ---
 
+## 工具路由与多会话隔离
+
+当本机安装的 `agy` CLI 支持 `--process-per-session` 时，适配器会自动启用该官方 ACP 参数，使每个新建 ACP 会话独立拉取自己的 HTTP MCP 工具目录（同时同会话内的多轮对话依然复用热会话）；旧版本二进制会自动保持原有启动参数。[官方 ACP 参数参考](https://antigravity.google/docs/ide/extensions/acp/#flags)
+
+在标准 DSH 会话中，模型会获得当前会话 `dsh` 桥接端实际注册的精确 Eager 工具名；在 PTC 会话中，外层调用为 `mcp_dsh_run_code`，程序内部则使用 DSH SDK 中的原始工具名。即使环境中存在同名的外部 MCP 服务器，ACP 权限校验也仅放行当前 `dsh` 桥接端已注册的工具，工具执行与审批继续完全由 DSH 接管。
+
+---
+
 ## 开源许可证
 
 [MIT](./LICENSE)

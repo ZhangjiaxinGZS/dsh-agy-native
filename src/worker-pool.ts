@@ -258,6 +258,11 @@ export class AgyWorkerSlot {
           // Tear down any abandoned in-flight turn before starting a fresh prompt
           await this.#abortInFlightTurn(syncPlan.kind !== 'warm-incremental');
 
+          const routingBridgeToolNames =
+            options.purpose !== undefined && !endpoint.hasTools
+              ? undefined
+              : endpoint.bridgeToolNames;
+
           let promptParts;
           if (syncPlan.kind === 'warm-incremental' && this.#activeAcpSessionId) {
             if (this.#activeRawModelId !== targetRawModelId) {
@@ -295,14 +300,14 @@ export class AgyWorkerSlot {
                 signal: options.signal,
               });
               // Loaded sessions may have been created by an older adapter.
-              const routing = formatHarnessGuidelines(undefined, endpoint.bridgeToolNames);
+              const routing = formatHarnessGuidelines(undefined, routingBridgeToolNames ?? false);
               if (routing) promptParts.unshift({ type: 'text', text: routing });
             } else {
               await this.#openFreshSession(client, endpoint, targetRawModelId, cfg);
               promptParts = await buildFullReplayPromptParts({
                 messages: options.messages,
                 systemPrompt,
-                bridgeToolNames: endpoint.bridgeToolNames,
+                bridgeToolNames: routingBridgeToolNames,
                 loadImage: this.#loadImage,
                 signal: options.signal,
               });
@@ -312,7 +317,7 @@ export class AgyWorkerSlot {
             promptParts = await buildFullReplayPromptParts({
               messages: options.messages,
               systemPrompt,
-              bridgeToolNames: endpoint.bridgeToolNames,
+              bridgeToolNames: routingBridgeToolNames,
               loadImage: this.#loadImage,
               signal: options.signal,
             });

@@ -20,6 +20,7 @@ export {
   createSanitizedAgyEnv,
   probeAgyVersion,
   resolveAgyBinary,
+  supportsProcessPerSession,
 } from './binary.js';
 
 export {

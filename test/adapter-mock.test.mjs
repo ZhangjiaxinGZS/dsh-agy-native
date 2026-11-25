@@ -137,17 +137,20 @@ test('AgyAcpAdapter streams reasoning, parallel tool-calls, warm continuation, i
     assert.equal(step2Finish?.reason.kind, 'stop');
     const firstSessionId = step2Finish.replayState.response.acpSessionId;
 
-    // Auxiliary call (e.g. session-title) must NOT disturb `firstSessionId`!
+    // Auxiliary call (e.g. session-title) must NOT disturb `firstSessionId` or inject MCP guidelines!
     const auxChunks = await collectChunks(
       adapter.stream({
         provider: 'agy-acp',
         model: 'gemini-4-carbon',
         purpose: 'session-title',
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'Generate title' }] }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'Generate title ECHO_PROMPT' }] }],
       }),
     );
     const auxFinish = auxChunks.find((c) => c.type === 'finish');
     assert.notEqual(auxFinish.replayState.response.acpSessionId, firstSessionId);
+    const auxText = auxChunks.find((c) => c.type === 'block-end' && c.block.type === 'text');
+    assert.ok(auxText);
+    assert.doesNotMatch(auxText.block.text, /<workspace_guidelines>/);
 
     // Turn 2 on `dsh-sess-1` with multimodal ImageBlock reuses warm `firstSessionId` (Turn=2)!
     const asstFinal1 = {
