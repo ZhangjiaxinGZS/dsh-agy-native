@@ -362,7 +362,9 @@ test('formatHarnessGuidelines & buildFullReplayPromptParts strip third-party per
   assert.doesNotMatch(guidelines, /powered by DeepSeek Harness/i);
   assert.doesNotMatch(guidelines, /You are a coding agent/i);
   assert.match(guidelines, /mcp_dsh_<tool_name>/);
+  assert.match(guidelines, /brain\//);
   assert.match(guidelines, /Use the read tool/);
+  assert.equal(formatHarnessGuidelines(undefined, false), undefined);
 
   const parts = await buildFullReplayPromptParts({
     systemPrompt: rawSystem,

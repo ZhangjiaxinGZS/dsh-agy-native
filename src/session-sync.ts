@@ -74,14 +74,27 @@ export function formatHarnessGuidelines(
   const sections: string[] = [];
   if (bridgeToolNames !== false) {
     const names = bridgeToolNames === true ? undefined : bridgeToolNames;
-    const routing = ['Use only tools mounted by the DSH MCP server for this request. Do not call tools on ambient MCP servers, even when their names match.'];
+    const routing = [
+      'Use only tools mounted by the DSH MCP server for this request. Do not call tools on ambient MCP servers, even when their names match.',
+    ];
     if (names?.length === 0) {
-      routing.push('No DSH tools are available for this request.');
+      routing.push(
+        'No DSH tools are available for this request. Do not generate Antigravity Artifacts under `brain/`; respond directly.',
+      );
     } else if (names) {
-      routing.push(`Direct calls available in this request: ${names.map(name => `mcp_dsh_${name}`).join(', ')}.`);
-      routing.push('If a listed tool runs a program with a DSH SDK, invoke that entry point directly. Inside the program, use the exact DSH tool names in the supplied SDK without the outer mcp_dsh_ prefix.');
+      routing.push(
+        `Direct calls available in this request: ${names.map((name) => `mcp_dsh_${name}`).join(', ')}.`,
+      );
+      routing.push(
+        'If a listed tool runs a program with a DSH SDK, invoke that entry point directly. Inside the program, use the exact DSH tool names in the supplied SDK without the outer mcp_dsh_ prefix.',
+      );
+      routing.push(
+        'Do not generate Antigravity Artifacts under `brain/`; respond directly or use the `mcp_dsh_*` tools.',
+      );
     } else {
-      routing.push('Invoke the advertised mcp_dsh_<tool_name> directly.');
+      routing.push(
+        'Invoke the advertised mcp_dsh_<tool_name> directly. Do not generate Antigravity Artifacts under `brain/`; respond directly or use the `mcp_dsh_*` tools.',
+      );
     }
     sections.push(routing.join(' '));
   }
