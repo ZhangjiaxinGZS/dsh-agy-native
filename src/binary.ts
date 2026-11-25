@@ -151,3 +151,20 @@ export async function probeAgyVersion(agyPath: string, timeoutMs = 4000): Promis
     return undefined;
   }
 }
+
+const acpSessionWorkers = new Map<string, Promise<boolean>>();
+
+/** Older ACP binaries may not implement per-session HTTP MCP workers. */
+export function supportsProcessPerSession(agyPath: string): Promise<boolean> {
+  const cached = acpSessionWorkers.get(agyPath);
+  if (cached) return cached;
+  const supported = execFileAsync(agyPath, ['acp', '--help'], {
+    env: createSanitizedAgyEnv(),
+    timeout: 4000,
+  }).then(
+    ({ stdout, stderr }) => /^\s*--process-per-session(?:\s|$)/m.test(stdout + '\n' + stderr),
+    () => false,
+  );
+  acpSessionWorkers.set(agyPath, supported);
+  return supported;
+}

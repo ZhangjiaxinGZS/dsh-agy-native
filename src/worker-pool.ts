@@ -5,7 +5,7 @@ import type {
   TokenUsage,
 } from '@deepseek-ai/dsh-llm';
 import { AcpWorkerClient, type AcpAgentCapabilitiesSummary } from './acp-client.js';
-import { resolveAgyBinary } from './binary.js';
+import { resolveAgyBinary, supportsProcessPerSession } from './binary.js';
 import type { AgyModelCatalog } from './catalog.js';
 import {
   computeToolsFingerprint,
@@ -19,6 +19,7 @@ import {
   computeHistoryPrefixDigest,
   extractReplayMetadata,
   extractSystemPrompt,
+  formatHarnessGuidelines,
   planSessionSync,
   type ImageBytesLoader,
 } from './session-sync.js';
@@ -293,12 +294,15 @@ export class AgyWorkerSlot {
                 loadImage: this.#loadImage,
                 signal: options.signal,
               });
+              // Loaded sessions may have been created by an older adapter.
+              const routing = formatHarnessGuidelines(undefined, endpoint.bridgeToolNames);
+              if (routing) promptParts.unshift({ type: 'text', text: routing });
             } else {
               await this.#openFreshSession(client, endpoint, targetRawModelId, cfg);
               promptParts = await buildFullReplayPromptParts({
                 messages: options.messages,
                 systemPrompt,
-                hasTools: endpoint.hasTools,
+                bridgeToolNames: endpoint.bridgeToolNames,
                 loadImage: this.#loadImage,
                 signal: options.signal,
               });
@@ -308,7 +312,7 @@ export class AgyWorkerSlot {
             promptParts = await buildFullReplayPromptParts({
               messages: options.messages,
               systemPrompt,
-              hasTools: endpoint.hasTools,
+              bridgeToolNames: endpoint.bridgeToolNames,
               loadImage: this.#loadImage,
               signal: options.signal,
             });
@@ -511,6 +515,7 @@ export class AgyWorkerSlot {
     const agyPath = resolveAgyBinary(cfg.agyPath);
     this.#client = new AcpWorkerClient({
       agyPath,
+      extraArgs: await supportsProcessPerSession(agyPath) ? ['--process-per-session'] : [],
       cwd: cfg.workingDirectory,
       startupTimeoutMs: cfg.startupTimeoutMs,
     });

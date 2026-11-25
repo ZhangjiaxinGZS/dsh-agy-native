@@ -34,7 +34,12 @@ export function encodeMcpToolName(name: string, usedNames: Set<string>): string 
     return base;
   }
   const suffix = crypto.createHash('sha1').update(name).digest('hex').slice(0, 6);
-  const candidate = `${base.slice(0, 56)}_${suffix}`;
+  const stem = `${base.slice(0, 56)}_${suffix}`;
+  let candidate = stem;
+  for (let n = 2; usedNames.has(candidate); n++) {
+    const tail = `_${n}`;
+    candidate = stem.slice(0, 64 - tail.length) + tail;
+  }
   usedNames.add(candidate);
   return candidate;
 }
@@ -94,8 +99,6 @@ export class McpSessionEndpoint {
 
   #tools: readonly ToolSchema[] = [];
   #mcpToDsh = new Map<string, ToolSchema>();
-  #dshToMcp = new Map<string, string>();
-  #allowedAcpToolNames = new Set<string>();
   #callSeq = 0;
 
   readonly #pendingById = new Map<string, PendingMcpToolCall>();
@@ -135,21 +138,21 @@ export class McpSessionEndpoint {
   setTools(tools: readonly ToolSchema[] | undefined): void {
     this.#tools = tools ?? [];
     this.#mcpToDsh.clear();
-    this.#dshToMcp.clear();
-    this.#allowedAcpToolNames.clear();
 
     const used = new Set<string>();
     for (const tool of this.#tools) {
       const mcpName = encodeMcpToolName(tool.name, used);
       this.#mcpToDsh.set(mcpName, tool);
-      this.#dshToMcp.set(tool.name, mcpName);
-      this.#allowedAcpToolNames.add(mcpName);
-      this.#allowedAcpToolNames.add(`mcp_${MCP_SERVER_NAME}_${mcpName}`);
     }
   }
 
   get hasTools(): boolean {
     return this.#tools.length > 0;
+  }
+
+  /** Encoded names as advertised by this endpoint in MCP tools/list. */
+  get bridgeToolNames(): string[] {
+    return [...this.#mcpToDsh.keys()];
   }
 
   get pendingCount(): number {
@@ -166,7 +169,10 @@ export class McpSessionEndpoint {
 
   /** Check whether an ACP `session/request_permission` tool request belongs to our DSH bridge. */
   isAllowedPermissionRequest(toolName?: string, rawInput?: Record<string, unknown>): boolean {
-    if (toolName && this.#allowedAcpToolNames.has(toolName)) return true;
+    const prefix = `mcp_${MCP_SERVER_NAME}_`;
+    if (toolName?.startsWith(prefix)) return this.#mcpToDsh.has(toolName.slice(prefix.length));
+    // Only the ACP MCP dispatcher takes server/tool routing fields as input.
+    if (toolName !== 'call_mcp_tool') return false;
     const serverName =
       (rawInput?.ServerName as string | undefined) ??
       (rawInput?.serverName as string | undefined) ??

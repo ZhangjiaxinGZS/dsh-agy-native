@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline';
 
+if (process.argv.includes('--help')) {
+  console.log('  --process-per-session  Isolate session workers');
+  process.exit(0);
+}
+
 const rl = createInterface({ input: process.stdin });
 const sessions = new Map();
 let sessionCounter = 0;
@@ -44,6 +49,10 @@ rl.on('line', async (line) => {
 
   if (msg.method === 'session/new') {
     const meta = msg.params?._meta?.antigravity ?? {};
+    if (msg.params.mcpServers?.length && !process.argv.includes('--process-per-session')) {
+      send({ id: msg.id, error: { code: -32602, message: 'Missing per-session HTTP MCP worker' } });
+      return;
+    }
     if (meta.excludeDefaultComponents === true) {
       send({
         id: msg.id,

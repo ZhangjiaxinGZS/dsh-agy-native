@@ -64,7 +64,7 @@ export function extractSystemPrompt(
  */
 export function formatHarnessGuidelines(
   rawSystemPrompt: string | undefined,
-  hasTools: boolean,
+  bridgeToolNames: readonly string[] | boolean,
 ): string | undefined {
   const cleaned = (rawSystemPrompt ?? '')
     .replace(THIRD_PARTY_PERSONA_LINE_RE, '')
@@ -72,10 +72,18 @@ export function formatHarnessGuidelines(
     .trim();
 
   const sections: string[] = [];
-  if (hasTools) {
-    sections.push(
-      'Active workspace tools are mounted as eager MCP tools named `mcp_dsh_<tool_name>` (e.g. `mcp_dsh_read`, `mcp_dsh_bash`, `mcp_dsh_edit`, `mcp_dsh_glob`, `mcp_dsh_grep`). Invoke them directly when tool execution is needed.',
-    );
+  if (bridgeToolNames !== false) {
+    const names = bridgeToolNames === true ? undefined : bridgeToolNames;
+    const routing = ['Use only tools mounted by the DSH MCP server for this request. Do not call tools on ambient MCP servers, even when their names match.'];
+    if (names?.length === 0) {
+      routing.push('No DSH tools are available for this request.');
+    } else if (names) {
+      routing.push(`Direct calls available in this request: ${names.map(name => `mcp_dsh_${name}`).join(', ')}.`);
+      routing.push('If a listed tool runs a program with a DSH SDK, invoke that entry point directly. Inside the program, use the exact DSH tool names in the supplied SDK without the outer mcp_dsh_ prefix.');
+    } else {
+      routing.push('Invoke the advertised mcp_dsh_<tool_name> directly.');
+    }
+    sections.push(routing.join(' '));
   }
   if (cleaned) {
     sections.push(cleaned);
@@ -366,12 +374,14 @@ export async function buildIncrementalPromptParts(opts: {
 export async function buildFullReplayPromptParts(opts: {
   messages: readonly RequestMessage[];
   systemPrompt?: string;
+  /** Legacy callers may supply presence only. */
   hasTools?: boolean;
+  bridgeToolNames?: readonly string[];
   loadImage?: ImageBytesLoader;
   signal?: AbortSignal;
 }): Promise<AcpPromptPart[]> {
   const parts: AcpPromptPart[] = [];
-  const guidelines = formatHarnessGuidelines(opts.systemPrompt, Boolean(opts.hasTools));
+  const guidelines = formatHarnessGuidelines(opts.systemPrompt, opts.bridgeToolNames ?? Boolean(opts.hasTools));
   if (guidelines) {
     appendTextPart(parts, guidelines);
   }
