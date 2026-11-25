@@ -61,7 +61,7 @@ cd dsh-agy-native
 npm install
 npm test
 npm pack
-dsh plugin --profile web add -w ./dsh-agy-native-0.1.0.tgz
+dsh plugin --profile web add -w ./dsh-agy-native-0.2.0.tgz
 ```
 
 Once enabled, select **Antigravity (Google AI Ultra / Pro)** in the DSH model picker and choose both your model family (e.g., `Gemini 4 Carbon`, `Gemini 4 Hydrogen`) and reasoning effort (`Low`, `Medium`, `High`, `XHigh`).

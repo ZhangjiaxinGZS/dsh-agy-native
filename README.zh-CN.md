@@ -65,7 +65,7 @@ cd dsh-agy-native
 npm install
 npm test
 npm pack
-dsh plugin --profile web add -w ./dsh-agy-native-0.1.0.tgz
+dsh plugin --profile web add -w ./dsh-agy-native-0.2.0.tgz
 ```
 
 安装后在 DSH 模型选择器中选择 **Antigravity (Google AI Ultra / Pro)**，即可自由切换模型（如 `Gemini 4 Carbon`、`Gemini 4 Hydrogen`）及推理档位（`Low` / `Medium` / `High` / `XHigh`）。
